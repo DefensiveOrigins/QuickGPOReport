@@ -23,6 +23,33 @@ Import-Module ActiveDirectory -ErrorAction Stop
 Import-Module GroupPolicy -ErrorAction Stop
 
 # --- Helpers ---
+
+function Get-GpoSecurityFilters {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$GpoName
+    )
+    $list = @()
+    try {
+        # Ensure the cmdlet exists (older RSAT installs or minimal servers may lack it)
+        if (-not (Get-Command Get-GPPermission -ErrorAction SilentlyContinue)) {
+            Write-Verbose "Get-GPPermission not available; skipping security filtering for '$GpoName'."
+            return $list
+        }
+
+        $perms = Get-GPPermission -Name $GpoName -All -ErrorAction Stop
+        foreach ($p in $perms) {
+            if ($p.Permission -eq 'GpoApply' -and $p.Type -eq 'Allow') {
+                $list += $p.Trustee.Name
+            }
+        }
+    } catch {
+        Write-Verbose "Get-GpoSecurityFilters failed for '$GpoName': $_"
+    }
+    return ($list | Sort-Object -Unique)
+}
+
 function HtmlEsc([string]$s) {
     if ($null -eq $s) { return "" }
     ($s -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;' -replace '"','&quot;')
