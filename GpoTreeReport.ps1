@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Generate an HTML tree report of Group Policy application with per-setting lines and stdout progress.
+  Generate an HTML tree report of Group Policy application with per-setting lines, stdout progress, and robust parsing.
 
 .REQUIREMENTS
   RSAT modules: ActiveDirectory, GroupPolicy
@@ -61,31 +61,10 @@ function Get-GpoReportXmlByGuid([guid]$Guid) {
     try { [xml](Get-GPOReport -Guid $Guid -ReportType Xml -ErrorAction Stop) } catch { $null }
 }
 
-function Get-GpoWmiFilterFromXml([xml]$GpoXml) {
-    if (-not $GpoXml) { return $null }
-    $w = $GpoXml.GPO.WMIFilter
-    if ($w -and $w.Name) {
-        if ($w.Query) { return ("{0} ({1})" -f $w.Name, ($w.Query -replace '\s+',' ')) }
-        return $w.Name
-    }
-    $null
-}
+# --- SETTINGS ENUMERATION (XML first, then HTML fallback) ---
 
-function Get-GpoSecurityFilters($GpoName) {
-    $list = @()
-    try {
-        $perms = Get-GPPermission -Name $GpoName -All -ErrorAction Stop
-        foreach ($p in $perms) {
-            if ($p.Permission -eq 'GpoApply' -and $p.Type -eq 'Allow') {
-                $list += $p.Trustee.Name
-            }
-        }
-    } catch {}
-    $list | Sort-Object -Unique
-}
-
-# ---- Aggressive settings enumeration (works across schema variants) ----
-function Get-GpoSettingLines([xml]$GpoXml) {
+# XML: aggressive schema coverage
+function Get-GpoSettingLinesFromXml([xml]$GpoXml) {
     $lines = New-Object System.Collections.Generic.List[string]
     if (-not $GpoXml) { return $lines }
 
@@ -100,7 +79,6 @@ function Get-GpoSettingLines([xml]$GpoXml) {
     }
 
     function Grab([xml.xmlelement]$node, [string]$side) {
-        # Prefer attributes, then child elements
         $disp  = $node.GetAttribute("displayName")
         if (-not $disp) { $disp = $node.GetAttribute("name") }
         if (-not $disp -and $node.SelectSingleNode("displayName")) { $disp = $node.SelectSingleNode("displayName").InnerText }
@@ -134,18 +112,18 @@ function Get-GpoSettingLines([xml]$GpoXml) {
         if ($parts.Count) { $lines.Add(($parts -join " | ")) }
     }
 
-    # 1) Any <Policy> node anywhere
+    # Any <Policy> node
     $policyNodes = $GpoXml.SelectNodes("//GPO//*[local-name()='Policy']")
     foreach ($n in $policyNodes) { Grab -node $n -side (Get-SideTag $n) }
 
-    # 2) Registry Preferences
+    # Registry Preferences
     $regNodes = $GpoXml.SelectNodes("//GPO//RegistrySettings/RegistrySetting")
     foreach ($n in $regNodes) {
         $side = Get-SideTag $n
         $lines.Add(("{0} RegistryPreference | Action={1} | Key={2} | ValueName={3} | Data={4} | Type={5}" -f $side,$n.Action,$n.Key,$n.ValueName,$n.Data,$n.Type).Trim())
     }
 
-    # 3) Generic Preferences (Files, Shortcuts, Tasks, etc.) — nodes with an 'action' attribute
+    # Generic Preferences (Files, Shortcuts, Tasks, etc.) — nodes with an 'action' attribute
     $prefNodes = $GpoXml.SelectNodes("//GPO//*[local-name()='Preferences']//*[@action]")
     foreach ($n in $prefNodes) {
         $side   = Get-SideTag $n
@@ -163,7 +141,7 @@ function Get-GpoSettingLines([xml]$GpoXml) {
         $lines.Add(($parts -join " | "))
     }
 
-    # 4) Scripts (Startup/Shutdown/Logon/Logoff)
+    # Scripts
     $scriptNodes = $GpoXml.SelectNodes("//GPO//Scripts/*/Script")
     foreach ($s in $scriptNodes) {
         $phase = $s.ParentNode.Name
@@ -173,7 +151,7 @@ function Get-GpoSettingLines([xml]$GpoXml) {
         $lines.Add(("{0} Script:{1} | {2} {3}" -f $side,$phase,$cmd,$pars).Trim())
     }
 
-    # 5) Common SecEdit summaries (Account/Kerberos/Audit/etc.)
+    # Common SecEdit summaries
     foreach ($nodeName in @("Account","Kerberos","Audit","EventAudit","PasswordPolicy","KerberosPolicy")) {
         $nodes = $GpoXml.SelectNodes("//GPO//Computer/$nodeName/*")
         foreach ($n in $nodes) {
@@ -185,11 +163,55 @@ function Get-GpoSettingLines([xml]$GpoXml) {
     ($lines | Where-Object { $_ -and $_.Trim() } | Sort-Object -Unique)
 }
 
+# HTML fallback: parse the HTML table rows into "one-line" settings
+function Get-GpoSettingLinesFromHtml([string]$HtmlText) {
+    $out = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($HtmlText)) { return $out }
+
+    # Normalize whitespace
+    $h = $HtmlText -replace "`r","" -replace "`n"," "
+
+    # Roughly pull rows from HTML setting tables; extract first 2-3 cells as "Name | Value | Extra"
+    $rowMatches = [regex]::Matches($h, "<tr[^>]*>(.*?)</tr>", "IgnoreCase")
+    foreach ($rm in $rowMatches) {
+        $row = $rm.Groups[1].Value
+        $cells = [regex]::Matches($row, "<t[dh][^>]*>(.*?)</t[dh]>", "IgnoreCase")
+        if ($cells.Count -ge 1) {
+            $vals = @()
+            foreach ($c in $cells) {
+                $txt = $c.Groups[1].Value
+                # strip remaining tags & compress spaces
+                $txt = ($txt -replace "<.*?>"," " -replace "\s+"," ").Trim()
+                if ($txt) { $vals += $txt }
+            }
+            if ($vals.Count -gt 0) {
+                # Heuristic: keep it short & useful
+                $line = $vals[0]
+                if ($vals.Count -gt 1) { $line += " | " + $vals[1] }
+                if ($vals.Count -gt 2 -and $vals[2] -notmatch '^Not Configured$') { $line += " | " + $vals[2] }
+                if ($line -and $line -notmatch '^\s*(Setting|Policy|Name)\s*$') {
+                    $out.Add($line)
+                }
+            }
+        }
+    }
+
+    ($out | Where-Object { $_ -and $_.Trim() } | Sort-Object -Unique)
+}
+
+# Returns settings, trying XML first; if empty, tries HTML
+function Get-GpoSettingLines([xml]$XmlReport, [string]$HtmlReport) {
+    $fromXml  = Get-GpoSettingLinesFromXml -GpoXml $XmlReport
+    if ($fromXml.Count -gt 0) { return $fromXml }
+    Get-GpoSettingLinesFromHtml -HtmlText $HtmlReport
+}
+
 # --- Collect GPOs and cache reports (with stdout progress) ---
 $allGpos = Get-GPO -All
 Write-Host "Discovered $($allGpos.Count) GPO(s) in the domain."
 
 $gpoXmlCache      = @{}
+$gpoHtmlCache     = @{}
 $gpoWmiCache      = @{}
 $gpoFiltersCache  = @{}
 $gpoSettingsCache = @{}
@@ -198,13 +220,20 @@ $gpoStatusCache   = @{}
 $totalSettings = 0
 foreach ($gpo in $allGpos) {
     try {
-        [xml]$xml = Get-GPOReport -Guid $gpo.Id -ReportType Xml -ErrorAction Stop
-        $gpoXmlCache[$gpo.Id.Guid.ToString()]      = $xml
-        $gpoWmiCache[$gpo.Id.Guid.ToString()]      = Get-GpoWmiFilterFromXml -GpoXml $xml
-        $gpoFiltersCache[$gpo.Id.Guid.ToString()]  = Get-GpoSecurityFilters -GpoName $gpo.DisplayName
-        $gpoStatusCache[$gpo.Id.Guid.ToString()]   = Get-GpoStatusInfo -gpoObj $gpo -gpoXml $xml
+        $xml  = Get-GpoReportXmlByGuid -Guid $gpo.Id
+        $html = $null
+        try { $html = Get-GPOReport -Guid $gpo.Id -ReportType Html -ErrorAction Stop } catch { }
 
-        $settings = Get-GpoSettingLines -GpoXml $xml
+        $gpoXmlCache[$gpo.Id.Guid.ToString()]  = $xml
+        $gpoHtmlCache[$gpo.Id.Guid.ToString()] = $html
+        $gpoWmiCache[$gpo.Id.Guid.ToString()]  = if ($xml) { 
+            $w = $xml.GPO.WMIFilter
+            if ($w -and $w.Name) { if ($w.Query) { "{0} ({1})" -f $w.Name, ($w.Query -replace '\s+',' ') } else { $w.Name } } else { $null }
+        } else { $null }
+        $gpoFiltersCache[$gpo.Id.Guid.ToString()] = Get-GpoSecurityFilters -GpoName $gpo.DisplayName
+        $gpoStatusCache[$gpo.Id.Guid.ToString()]  = Get-GpoStatusInfo -gpoObj $gpo -gpoXml $xml
+
+        $settings = Get-GpoSettingLines -XmlReport $xml -HtmlReport $html
         $gpoSettingsCache[$gpo.Id.Guid.ToString()] = $settings
         $totalSettings += $settings.Count
 
@@ -293,6 +322,7 @@ foreach ($t in $targets) {
         }
 
         $xml      = $gpoXmlCache[$guidStr]
+        $html     = $gpoHtmlCache[$guidStr]
         $wmi      = $gpoWmiCache[$guidStr]
         $filters  = $gpoFiltersCache[$guidStr]
         $settings = $gpoSettingsCache[$guidStr]
@@ -317,7 +347,17 @@ foreach ($t in $targets) {
         if ($settings.Count -gt 0) {
             foreach ($s in $settings) { AddLine $sb ("<li><code>{0}</code></li>" -f (HtmlEsc $s)) }
         } else {
-            AddLine $sb "<li class=""small subtle"">(No explicit settings parsed or not applicable)</li>"
+            # If XML cache was empty but we do have the raw HTML, give a hint inside the report too.
+            if ($html) {
+                $fallbackLines = Get-GpoSettingLinesFromHtml -HtmlText $html
+                if ($fallbackLines.Count -gt 0) {
+                    foreach ($s in $fallbackLines) { AddLine $sb ("<li><code>{0}</code></li>" -f (HtmlEsc $s)) }
+                } else {
+                    AddLine $sb "<li class=""small subtle"">(No explicit settings parsed or not applicable)</li>"
+                }
+            } else {
+                AddLine $sb "<li class=""small subtle"">(No explicit settings parsed or not applicable)</li>"
+            }
         }
         AddLine $sb "</ul></details>"
 
@@ -379,6 +419,7 @@ if ($unusedGuids.Count -eq 0) {
         $g = $allGpos | Where-Object { $_.Id.Guid.ToString() -eq $guid }
         if (-not $g) { continue }
         $xml      = $gpoXmlCache[$guid]
+        $html     = $gpoHtmlCache[$guid]
         $wmi      = $gpoWmiCache[$guid]
         $filters  = $gpoFiltersCache[$guid]
         $settings = $gpoSettingsCache[$guid]
@@ -400,7 +441,16 @@ if ($unusedGuids.Count -eq 0) {
         if ($settings.Count -gt 0) {
             foreach ($s in $settings) { AddLine $sb ("<li><code>{0}</code></li>" -f (HtmlEsc $s)) }
         } else {
-            AddLine $sb "<li class=""small subtle"">(No explicit settings parsed or not applicable)</li>"
+            if ($html) {
+                $fallbackLines = Get-GpoSettingLinesFromHtml -HtmlText $html
+                if ($fallbackLines.Count -gt 0) {
+                    foreach ($s in $fallbackLines) { AddLine $sb ("<li><code>{0}</code></li>" -f (HtmlEsc $s)) }
+                } else {
+                    AddLine $sb "<li class=""small subtle"">(No explicit settings parsed or not applicable)</li>"
+                }
+            } else {
+                AddLine $sb "<li class=""small subtle"">(No explicit settings parsed or not applicable)</li>"
+            }
         }
         AddLine $sb "</ul></details>"
 
@@ -413,16 +463,25 @@ AddLine $sb "</div>"
 AddLine $sb "<hr /><div class=""small subtle"">Tip: Disabling the unused half (User/Computer) can reduce processing time.</div>"
 AddLine $sb "</body></html>"
 
-# --- Write HTML Report (ensure directory exists) ---
+# --- Write HTML Report (ensure directory exists, no inline 'if') ---
 try {
     $reportDir = Split-Path -Parent $OutputPath
     if ($reportDir -and -not (Test-Path -LiteralPath $reportDir)) {
         Write-Host "Creating report directory: $reportDir"
         New-Item -Path $reportDir -ItemType Directory -Force | Out-Null
     }
+
+    # Resolve to absolute path safely (no inline if)
+    if ([System.IO.Path]::IsPathRooted($OutputPath)) {
+        $resolvedOut = $OutputPath
+    } else {
+        $resolvedOut = Join-Path -Path (Get-Location) -ChildPath $OutputPath
+    }
+    $resolvedOut = [System.IO.Path]::GetFullPath($resolvedOut)
+
     $html = $sb.ToString()
-    [System.IO.File]::WriteAllText((Resolve-Path -LiteralPath (if ($OutputPath.Contains(':')) { $OutputPath } else { (Join-Path -Path (Get-Location) -ChildPath $OutputPath) })), $html, [System.Text.UTF8Encoding]::new($false))
-    Write-Host "HTML report written to $OutputPath"
+    [System.IO.File]::WriteAllText($resolvedOut, $html, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "HTML report written to $resolvedOut"
 } catch {
     Write-Error "Failed to write HTML report: $_"
 }
