@@ -1,10 +1,10 @@
 <# 
-GPO Tree → HTML report (no here-strings)
+GPO Tree → HTML report (safe quoting, no bare &)
 - OUs (incl. Domain root) → linked GPOs
 - Flags: Enforced, Link Enabled/Disabled
 - GPO Status badges: User/Computer settings disabled
 - WMI filter, Security filtering groups
-- Per-setting one-liners from GPO XML
+- One-line-per-setting from GPO XML
 - Separate "Unused GPOs" section
 
 Requirements: RSAT ActiveDirectory + GroupPolicy modules
@@ -60,7 +60,6 @@ function Parse-gPLinkString {
 
 function HtmlEsc([string]$s) {
     if ($null -eq $s) { return "" }
-    # Order matters: & before < >
     return ($s -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;' -replace '"','&quot;')
 }
 
@@ -72,7 +71,7 @@ function Get-GpoWmiFilterFromXml([xml]$GpoXml) {
     if (-not $GpoXml) { return $null }
     $w = $GpoXml.GPO.WMIFilter
     if ($w -and $w.Name) {
-        if ($w.Query) { return "{0} ({1})" -f $w.Name, ($w.Query -replace '\s+',' ') }
+        if ($w.Query) { return ("{0} ({1})" -f $w.Name, ($w.Query -replace '\s+',' ')) }
         return $w.Name
     }
     $null
@@ -92,23 +91,17 @@ function Get-GpoSecurityFilters($GpoName) {
 }
 
 function Get-GpoStatusInfo($gpoObj, [xml]$gpoXml) {
-    # Map explicitly; don't guess with -match "All"
     $status = $null
-    if ($gpoObj -and $gpoObj.PSObject.Properties.Name -contains 'GpoStatus') {
-        $status = [string]$gpoObj.GpoStatus
-    }
-    if (-not $status -and $gpoXml -and $gpoXml.GPO.GpoStatus) {
-        $status = [string]$gpoXml.GPO.GpoStatus
-    }
+    if ($gpoObj -and $gpoObj.PSObject.Properties.Name -contains 'GpoStatus') { $status = [string]$gpoObj.GpoStatus }
+    if (-not $status -and $gpoXml -and $gpoXml.GPO.GpoStatus) { $status = [string]$gpoXml.GPO.GpoStatus }
     if (-not $status) { $status = "AllSettingsEnabled" }
 
-    $compDisabled = $false
-    $userDisabled = $false
+    $compDisabled = $false; $userDisabled = $false
     switch ($status) {
-        'AllSettingsDisabled'     { $compDisabled = $true; $userDisabled = $true }
-        'ComputerSettingsDisabled'{ $compDisabled = $true }
-        'UserSettingsDisabled'    { $userDisabled = $true }
-        default { } # AllSettingsEnabled or unknown → both enabled
+        'AllSettingsDisabled'      { $compDisabled = $true; $userDisabled = $true }
+        'ComputerSettingsDisabled' { $compDisabled = $true }
+        'UserSettingsDisabled'     { $userDisabled = $true }
+        default { }
     }
 
     [pscustomobject]@{
@@ -175,7 +168,7 @@ function Get-GpoSettingLines([xml]$GpoXml) {
         $nodes = $GpoXml.SelectNodes("//Computer/$nodeName/*")
         foreach ($n in $nodes) {
             if ($n.InnerText -and $n.InnerText.Trim()) {
-                $lines.Add( ("Computer:{0} | {1}" -f $nodeName, ($n.OuterXml -replace '<.*?>',' ' -replace '\s+',' ').Trim()) )
+                $lines.Add(("Computer:{0} | {1}" -f $nodeName, ($n.OuterXml -replace '<.*?>',' ' -replace '\s+',' ').Trim()))
             }
         }
     }
@@ -183,12 +176,7 @@ function Get-GpoSettingLines([xml]$GpoXml) {
     $lines | Where-Object { $_ -and $_.Trim() } | Sort-Object -Unique
 }
 
-function AddLine([System.Text.StringBuilder]$sb, [string]$text) {
-    [void]$sb.Append($text)
-}
-function AddLineBreak([System.Text.StringBuilder]$sb) {
-    [void]$sb.Append("`n")
-}
+function AddLine([System.Text.StringBuilder]$sb, [string]$text) { [void]$sb.Append($text) }
 
 # ---------- Collect data ----------
 $domain     = Get-ADDomain
@@ -223,50 +211,40 @@ $linkedGuids = [System.Collections.Generic.HashSet[string]]::new()
 $unusedGuids = [System.Collections.Generic.HashSet[string]]::new()
 foreach ($k in $allGpos.Keys) { [void]$unusedGuids.Add($k) }
 
-# ---------- Build HTML safely (no here-strings) ----------
+# ---------- Build HTML (double quotes + numeric entities) ----------
 $sb   = New-Object System.Text.StringBuilder
 $css  = @(
-'<style>',
-'body { font-family: Segoe UI, Arial, sans-serif; margin: 20px; }',
-'h1 { margin-bottom: 0; }',
-'.subtle { color: #555; }',
-'.kv { font-family: ui-monospace, Consolas, monospace; }',
-'.badge { display:inline-block; padding:2px 6px; border-radius:8px; font-size:12px; margin-right:6px; border:1px solid #ccc; }',
-'.badge.enforced { background:#ffe9e9; border-color:#e09999; }',
-'.badge.disabled { background:#f5f5f5; }',
-'.badge.ok { background:#eaf7ea; border-color:#88b188; }',
-'.badge.warn { background:#fff7e0; border-color:#d9c06b; }',
-'.tree { margin: 0; padding-left: 20px; list-style-type: none; }',
-'.tree li { margin: 6px 0; }',
-'.tree li .title { font-weight:600; }',
-'details { margin: 4px 0; }',
-'summary { cursor: pointer; }',
-'.small { font-size: 12px; color:#666; }',
-'.meta { margin:2px 0 6px 0; }',
-'code { background:#f6f6f6; padding:1px 4px; border-radius:4px; }',
-'.section { margin-top: 24px; }',
-'hr { border:0; border-top:1px solid #ddd; margin:16px 0; }',
-'table { border-collapse: collapse; }',
-'td, th { padding: 6px 8px; border:1px solid #ddd; }',
-'</style>'
+"<style>",
+"body { font-family: Segoe UI, Arial, sans-serif; margin: 20px; }",
+"h1 { margin-bottom: 0; }",
+".subtle { color: #555; }",
+".kv { font-family: ui-monospace, Consolas, monospace; }",
+".badge { display:inline-block; padding:2px 6px; border-radius:8px; font-size:12px; margin-right:6px; border:1px solid #ccc; }",
+".badge.enforced { background:#ffe9e9; border-color:#e09999; }",
+".badge.disabled { background:#f5f5f5; }",
+".badge.ok { background:#eaf7ea; border-color:#88b188; }",
+".badge.warn { background:#fff7e0; border-color:#d9c06b; }",
+".tree { margin: 0; padding-left: 20px; list-style-type: none; }",
+".tree li { margin: 6px 0; }",
+".tree li .title { font-weight:600; }",
+"details { margin: 4px 0; }",
+"summary { cursor: pointer; }",
+".small { font-size: 12px; color:#666; }",
+".meta { margin:2px 0 6px 0; }",
+"code { background:#f6f6f6; padding:1px 4px; border-radius:4px; }",
+".section { margin-top: 24px; }",
+"hr { border:0; border-top:1px solid #ddd; margin:16px 0; }",
+"table { border-collapse: collapse; }",
+"td, th { padding: 6px 8px; border:1px solid #ddd; }",
+"</style>"
 ) -join "`n"
 
 $domainEsc = HtmlEsc $domain.DNSRoot
 $nowStr    = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 
-AddLine $sb '<!DOCTYPE html><html><head><meta charset="utf-8"><title>GPO Tree Report - '
-AddLine $sb $domainEsc
-AddLine $sb '</title>'
-AddLine $sb $css
-AddLine $sb '</head><body>'
-AddLine $sb '<h1>GPO Tree Report</h1><div class="subtle">Domain: <span class="kv">'
-AddLine $sb $domainEsc
-AddLine $sb '</span> &bull; Generated: <span class="kv">'
-AddLine $sb $nowStr
-AddLine $sb '</span></div><hr />'
-
-# OU → GPO Links
-AddLine $sb '<div class="section"><h2>OU → GPO Links</h2><ul class="tree">'
+AddLine $sb "<!DOCTYPE html><html><head><meta charset=""utf-8""><title>GPO Tree Report - $domainEsc</title>$css</head><body>"
+AddLine $sb "<h1>GPO Tree Report</h1><div class=""subtle"">Domain: <span class=""kv"">$domainEsc</span> &#8226; Generated: <span class=""kv"">$nowStr</span></div><hr />"
+AddLine $sb "<div class=""section""><h2>OU &#8594; GPO Links</h2><ul class=""tree"">"
 
 foreach ($ou in $ous) {
     $ouName = if ($ou -eq $domainRoot) { "Domain (root)" } else { $ou.Name }
@@ -274,20 +252,16 @@ foreach ($ou in $ous) {
     $inheritanceBlocked = $false
     if ($ou.PSObject.Properties.Name -contains 'gPOptions') { $inheritanceBlocked = [bool]($ou.gPOptions -band 1) }
 
-    AddLine $sb '<li><span class="title">OU:</span> '
-    AddLine $sb (HtmlEsc $ouName)
-    AddLine $sb ' <span class="small kv">('
-    AddLine $sb (HtmlEsc $dn)
-    AddLine $sb ')</span> '
-    if ($inheritanceBlocked) { AddLine $sb '<span class="badge warn">Inheritance Blocked</span>' }
+    AddLine $sb ("<li><span class=""title"">OU:</span> {0} <span class=""small kv"">({1})</span> " -f (HtmlEsc $ouName), (HtmlEsc $dn))
+    if ($inheritanceBlocked) { AddLine $sb "<span class=""badge warn"">Inheritance Blocked</span>" }
 
     $links = Parse-gPLinkString -gPLink $ou.gPLink
     if (-not $links -or $links.Count -eq 0) {
-        AddLine $sb '<div class="small subtle">(No linked GPOs)</div></li>'
+        AddLine $sb "<div class=""small subtle"">(No linked GPOs)</div></li>"
         continue
     }
 
-    AddLine $sb '<ul class="tree">'
+    AddLine $sb "<ul class=""tree"">"
 
     foreach ($l in $links) {
         [void]$linkedGuids.Add($l.Guid)
@@ -295,9 +269,7 @@ foreach ($ou in $ous) {
 
         $gpo = $allGpos[$l.Guid]
         if (-not $gpo) {
-            AddLine $sb '<li><span class="title">Missing GPO:</span> '
-            AddLine $sb (HtmlEsc $l.Guid)
-            AddLine $sb '</li>'
+            AddLine $sb ("<li><span class=""title"">Missing GPO:</span> {0}</li>" -f (HtmlEsc $l.Guid))
             continue
         }
 
@@ -308,51 +280,40 @@ foreach ($ou in $ous) {
         $settings= $gpoSettingsCache[$guidStr]
         $status  = $gpoStatusCache[$guidStr]
 
-        AddLine $sb '<li><div><span class="title">GPO:</span> '
-        AddLine $sb (HtmlEsc $gpo.DisplayName)
-        AddLine $sb ' <span class="small kv">('
-        AddLine $sb (HtmlEsc $guidStr)
-        AddLine $sb ')</span> '
-        if ($l.Enforced)     { AddLine $sb '<span class="badge enforced">Enforced</span>' }
-        if ($l.LinkDisabled) { AddLine $sb '<span class="badge disabled">Link Disabled</span>' }
-        if ($status.UserSettingsDisabled)     { AddLine $sb '<span class="badge warn">User settings disabled</span>' }
-        if ($status.ComputerSettingsDisabled) { AddLine $sb '<span class="badge warn">Computer settings disabled</span>' }
-        if ($wmi) { AddLine $sb '<span class="badge ok">WMI: '; AddLine $sb (HtmlEsc $wmi); AddLine $sb '</span>' }
-        AddLine $sb '</div>'
+        AddLine $sb ("<li><div><span class=""title"">GPO:</span> {0} <span class=""small kv"">({1})</span> " -f (HtmlEsc $gpo.DisplayName), (HtmlEsc $guidStr))
+        if ($l.Enforced)     { AddLine $sb "<span class=""badge enforced"">Enforced</span>" }
+        if ($l.LinkDisabled) { AddLine $sb "<span class=""badge disabled"">Link Disabled</span>" }
+        if ($status.UserSettingsDisabled)     { AddLine $sb "<span class=""badge warn"">User settings disabled</span>" }
+        if ($status.ComputerSettingsDisabled) { AddLine $sb "<span class=""badge warn"">Computer settings disabled</span>" }
+        if ($wmi) { AddLine $sb ("<span class=""badge ok"">WMI: {0}</span>" -f (HtmlEsc $wmi)) }
+        AddLine $sb "</div>"
 
         # Meta row
-        AddLine $sb '<div class="meta small"><b>Link Flags:</b> Enforced='
-        AddLine $sb ($(if($l.Enforced){'True'}else{'False'}))
-        AddLine $sb ', LinkEnabled='
-        AddLine $sb ($(if($l.LinkDisabled){'False'}else{'True'}))
-        AddLine $sb ' &nbsp;&nbsp; | &nbsp;&nbsp; <b>GPO Status:</b> '
-        AddLine $sb (HtmlEsc $status.StatusString)
+        AddLine $sb ("<div class=""meta small""><b>Link Flags:</b> Enforced={0}, LinkEnabled={1} &#160; | &#160; <b>GPO Status:</b> {2}" -f ($(if($l.Enforced){'True'}else{'False'}), $(if($l.LinkDisabled){'False'}else{'True'}), (HtmlEsc $status.StatusString)))
         if ($filters -and $filters.Count) {
-            AddLine $sb ' &nbsp;&nbsp; | &nbsp;&nbsp; <b>Security Filtering:</b> '
-            AddLine $sb (($filters | ForEach-Object { HtmlEsc $_ }) -join ', ')
+            AddLine $sb " &#160; | &#160; <b>Security Filtering:</b> "
+            AddLine $sb (($filters | ForEach-Object { HtmlEsc $_ }) -join ", ")
         }
-        AddLine $sb '</div>'
+        AddLine $sb "</div>"
 
         # Settings
-        AddLine $sb ('<details><summary>Settings ({0})</summary><ul class="tree">' -f $settings.Count)
+        AddLine $sb ("<details><summary>Settings ({0})</summary><ul class=""tree"">" -f $settings.Count)
         if ($settings.Count -gt 0) {
             foreach ($s in $settings) {
-                AddLine $sb '<li><code>'
-                AddLine $sb (HtmlEsc $s)
-                AddLine $sb '</code></li>'
+                AddLine $sb ("<li><code>{0}</code></li>" -f (HtmlEsc $s))
             }
         } else {
-            AddLine $sb '<li class="small subtle">(No explicit settings parsed or not applicable)</li>'
+            AddLine $sb "<li class=""small subtle"">(No explicit settings parsed or not applicable)</li>"
         }
-        AddLine $sb '</ul></details>'
+        AddLine $sb "</ul></details>"
 
-        AddLine $sb '</li>'
+        AddLine $sb "</li>"
     }
 
-    AddLine $sb '</ul></li>'
+    AddLine $sb "</ul></li>"
 }
 
-AddLine $sb '</ul></div>'  # end OU → GPO Links
+AddLine $sb "</ul></div>"
 
 # Summary + efficiency lists
 $gposUserDisabled     = @()
@@ -365,49 +326,41 @@ foreach ($kv in $gpoStatusCache.GetEnumerator()) {
     if ($kv.Value.ComputerSettingsDisabled) { $gposComputerDisabled += $gpo }
 }
 
-AddLine $sb '<div class="section"><h2>Summary</h2><table><tbody>'
-AddLine $sb ('<tr><th>Total OUs</th><td>{0}</td></tr>' -f ($ous.Count))
-AddLine $sb ('<tr><th>Total GPOs</th><td>{0}</td></tr>' -f ($allGpos.Count))
-AddLine $sb ('<tr><th>Linked GPOs</th><td>{0}</td></tr>' -f ($linkedGuids.Count))
-AddLine $sb ('<tr><th>Unused GPOs</th><td>{0}</td></tr>' -f ($unusedGuids.Count))
-AddLine $sb '</tbody></table>'
+AddLine $sb "<div class=""section""><h2>Summary</h2><table><tbody>"
+AddLine $sb ("<tr><th>Total OUs</th><td>{0}</td></tr>" -f ($ous.Count))
+AddLine $sb ("<tr><th>Total GPOs</th><td>{0}</td></tr>" -f ($allGpos.Count))
+AddLine $sb ("<tr><th>Linked GPOs</th><td>{0}</td></tr>" -f ($linkedGuids.Count))
+AddLine $sb ("<tr><th>Unused GPOs</th><td>{0}</td></tr>" -f ($unusedGuids.Count))
+AddLine $sb "</tbody></table>"
 
-AddLine $sb '<div style="margin-top:10px">'
-AddLine $sb '<details><summary><b>GPOs with User settings disabled</b> (for efficiency)</summary><ul class="tree">'
+AddLine $sb "<div style=""margin-top:10px"">"
+AddLine $sb "<details><summary><b>GPOs with User settings disabled</b> (for efficiency)</summary><ul class=""tree"">"
 if ($gposUserDisabled) {
     foreach ($g in ($gposUserDisabled | Sort-Object DisplayName)) {
-        AddLine $sb '<li>'
-        AddLine $sb (HtmlEsc $g.DisplayName)
-        AddLine $sb ' <span class="small kv">('
-        AddLine $sb (HtmlEsc $g.Id.Guid.ToString())
-        AddLine $sb ')</span></li>'
+        AddLine $sb ("<li>{0} <span class=""small kv"">({1})</span></li>" -f (HtmlEsc $g.DisplayName), (HtmlEsc $g.Id.Guid.ToString()))
     }
 } else {
-    AddLine $sb '<li class="small subtle">(None)</li>'
+    AddLine $sb "<li class=""small subtle"">(None)</li>"
 }
-AddLine $sb '</ul></details>'
+AddLine $sb "</ul></details>"
 
-AddLine $sb '<details><summary><b>GPOs with Computer settings disabled</b> (for efficiency)</summary><ul class="tree">'
+AddLine $sb "<details><summary><b>GPOs with Computer settings disabled</b> (for efficiency)</summary><ul class=""tree"">"
 if ($gposComputerDisabled) {
     foreach ($g in ($gposComputerDisabled | Sort-Object DisplayName)) {
-        AddLine $sb '<li>'
-        AddLine $sb (HtmlEsc $g.DisplayName)
-        AddLine $sb ' <span class="small kv">('
-        AddLine $sb (HtmlEsc $g.Id.Guid.ToString())
-        AddLine $sb ')</span></li>'
+        AddLine $sb ("<li>{0} <span class=""small kv"">({1})</span></li>" -f (HtmlEsc $g.DisplayName), (HtmlEsc $g.Id.Guid.ToString()))
     }
 } else {
-    AddLine $sb '<li class="small subtle">(None)</li>'
+    AddLine $sb "<li class=""small subtle"">(None)</li>"
 }
-AddLine $sb '</ul></details>'
-AddLine $sb '</div></div>'
+AddLine $sb "</ul></details>"
+AddLine $sb "</div></div>"
 
 # Unused GPOs
-AddLine $sb '<div class="section"><h2>Unused GPOs</h2>'
+AddLine $sb "<div class=""section""><h2>Unused GPOs</h2>"
 if ($unusedGuids.Count -eq 0) {
-    AddLine $sb '<div class="small subtle">(None)</div>'
+    AddLine $sb "<div class=""small subtle"">(None)</div>"
 } else {
-    AddLine $sb '<ul class="tree">'
+    AddLine $sb "<ul class=""tree"">"
     foreach ($guid in ($unusedGuids | Sort-Object)) {
         $g = $allGpos[$guid]; if (-not $g) { continue }
         $xml     = $gpoXmlCache[$guid]
@@ -416,42 +369,36 @@ if ($unusedGuids.Count -eq 0) {
         $settings= $gpoSettingsCache[$guid]
         $status  = $gpoStatusCache[$guid]
 
-        AddLine $sb '<li><div><span class="title">GPO:</span> '
-        AddLine $sb (HtmlEsc $g.DisplayName)
-        AddLine $sb ' <span class="small kv">('
-        AddLine $sb (HtmlEsc $g.Id.Guid.ToString())
-        AddLine $sb ')</span> '
-        if ($status.UserSettingsDisabled)     { AddLine $sb '<span class="badge warn">User settings disabled</span>' }
-        if ($status.ComputerSettingsDisabled) { AddLine $sb '<span class="badge warn">Computer settings disabled</span>' }
-        if ($wmi) { AddLine $sb '<span class="badge ok">WMI: '; AddLine $sb (HtmlEsc $wmi); AddLine $sb '</span>' }
-        AddLine $sb '</div>'
+        AddLine $sb ("<li><div><span class=""title"">GPO:</span> {0} <span class=""small kv"">({1})</span> " -f (HtmlEsc $g.DisplayName), (HtmlEsc $g.Id.Guid.ToString()))
+        if ($status.UserSettingsDisabled)     { AddLine $sb "<span class=""badge warn"">User settings disabled</span>" }
+        if ($status.ComputerSettingsDisabled) { AddLine $sb "<span class=""badge warn"">Computer settings disabled</span>" }
+        if ($wmi) { AddLine $sb ("<span class=""badge ok"">WMI: {0}</span>" -f (HtmlEsc $wmi)) }
+        AddLine $sb "</div>"
 
         if ($filters -and $filters.Count) {
-            AddLine $sb '<div class="meta small"><b>Security Filtering:</b> '
-            AddLine $sb (($filters | ForEach-Object { HtmlEsc $_ }) -join ', ')
-            AddLine $sb '</div>'
+            AddLine $sb "<div class=""meta small""><b>Security Filtering:</b> "
+            AddLine $sb (($filters | ForEach-Object { HtmlEsc $_ }) -join ", ")
+            AddLine $sb "</div>"
         }
 
-        AddLine $sb ('<details><summary>Settings ({0})</summary><ul class="tree">' -f $settings.Count)
+        AddLine $sb ("<details><summary>Settings ({0})</summary><ul class=""tree"">" -f $settings.Count)
         if ($settings.Count -gt 0) {
             foreach ($s in $settings) {
-                AddLine $sb '<li><code>'
-                AddLine $sb (HtmlEsc $s)
-                AddLine $sb '</code></li>'
+                AddLine $sb ("<li><code>{0}</code></li>" -f (HtmlEsc $s))
             }
         } else {
-            AddLine $sb '<li class="small subtle">(No explicit settings parsed or not applicable)</li>'
+            AddLine $sb "<li class=""small subtle"">(No explicit settings parsed or not applicable)</li>"
         }
-        AddLine $sb '</ul></details>'
+        AddLine $sb "</ul></details>"
 
-        AddLine $sb '</li>'
+        AddLine $sb "</li>"
     }
-    AddLine $sb '</ul>'
+    AddLine $sb "</ul>"
 }
-AddLine $sb '</div>'
+AddLine $sb "</div>"
 
-AddLine $sb '<hr /><div class="small subtle">Tip: Disabling the unused half (User/Computer) can reduce processing time.</div>'
-AddLine $sb '</body></html>'
+AddLine $sb "<hr /><div class=""small subtle"">Tip: Disabling the unused half (User/Computer) can reduce processing time.</div>"
+AddLine $sb "</body></html>"
 
 # Write file
 try {
