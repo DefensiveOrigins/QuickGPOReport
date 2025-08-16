@@ -1,16 +1,9 @@
 <#
 .SYNOPSIS
-    Generate an HTML tree report of Group Policy Objects (GPOs) and their application.
+  Generate an HTML tree report of Group Policy application with per-setting lines and stdout progress.
 
-.DESCRIPTION
-    This script lists all Group Policy Objects in the environment in a tree format.
-    The report includes:
-        - OU structure with linked GPOs
-        - Unused GPOs
-        - GPO filters (Security, WMI, Enforced, Inheritance blocking)
-        - Whether User/Computer settings are disabled
-        - Enumerated settings inside each GPO (single-line format)
-    Outputs an HTML report and prints progress to stdout.
+.REQUIREMENTS
+  RSAT modules: ActiveDirectory, GroupPolicy
 #>
 
 [CmdletBinding()]
@@ -18,17 +11,80 @@ param(
     [string]$OutputPath = ".\GpoTreeReport.html"
 )
 
-Import-Module GroupPolicy
-
-# Helpers
-function HtmlEsc($text) {
-    return [System.Web.HttpUtility]::HtmlEncode($text)
+# --- Prereqs ---
+$modules = @("ActiveDirectory","GroupPolicy")
+foreach ($m in $modules) {
+    if (-not (Get-Module -ListAvailable -Name $m)) {
+        Write-Error "Required module '$m' is not available. Install/enable RSAT ($m) and re-run."
+        return
+    }
 }
-function AddLine([System.Text.StringBuilder]$sb, [string]$line) {
-    $null = $sb.AppendLine($line)
+Import-Module ActiveDirectory -ErrorAction Stop
+Import-Module GroupPolicy -ErrorAction Stop
+
+# --- Helpers ---
+function HtmlEsc([string]$s) {
+    if ($null -eq $s) { return "" }
+    ($s -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;' -replace '"','&quot;')
 }
 
-# --- SETTINGS ENUMERATION ---
+function AddLine([System.Text.StringBuilder]$sb, [string]$text) {
+    [void]$sb.Append($text)
+}
+
+function Get-GpoStatusInfo($gpoObj, [xml]$gpoXml) {
+    $status = $null
+    if ($gpoObj -and $gpoObj.PSObject.Properties.Name -contains 'GpoStatus') {
+        $status = [string]$gpoObj.GpoStatus
+    }
+    if (-not $status -and $gpoXml -and $gpoXml.GPO.GpoStatus) {
+        $status = [string]$gpoXml.GPO.GpoStatus
+    }
+    if (-not $status) { $status = "AllSettingsEnabled" }
+
+    $compDisabled = $false; $userDisabled = $false
+    switch ($status) {
+        'AllSettingsDisabled'      { $compDisabled = $true; $userDisabled = $true }
+        'ComputerSettingsDisabled' { $compDisabled = $true }
+        'UserSettingsDisabled'     { $userDisabled = $true }
+        default { }
+    }
+
+    [pscustomobject]@{
+        StatusString              = $status
+        ComputerSettingsDisabled  = $compDisabled
+        UserSettingsDisabled      = $userDisabled
+    }
+}
+
+function Get-GpoReportXmlByGuid([guid]$Guid) {
+    try { [xml](Get-GPOReport -Guid $Guid -ReportType Xml -ErrorAction Stop) } catch { $null }
+}
+
+function Get-GpoWmiFilterFromXml([xml]$GpoXml) {
+    if (-not $GpoXml) { return $null }
+    $w = $GpoXml.GPO.WMIFilter
+    if ($w -and $w.Name) {
+        if ($w.Query) { return ("{0} ({1})" -f $w.Name, ($w.Query -replace '\s+',' ')) }
+        return $w.Name
+    }
+    $null
+}
+
+function Get-GpoSecurityFilters($GpoName) {
+    $list = @()
+    try {
+        $perms = Get-GPPermission -Name $GpoName -All -ErrorAction Stop
+        foreach ($p in $perms) {
+            if ($p.Permission -eq 'GpoApply' -and $p.Type -eq 'Allow') {
+                $list += $p.Trustee.Name
+            }
+        }
+    } catch {}
+    $list | Sort-Object -Unique
+}
+
+# ---- Aggressive settings enumeration (works across schema variants) ----
 function Get-GpoSettingLines([xml]$GpoXml) {
     $lines = New-Object System.Collections.Generic.List[string]
     if (-not $GpoXml) { return $lines }
@@ -44,16 +100,17 @@ function Get-GpoSettingLines([xml]$GpoXml) {
     }
 
     function Grab([xml.xmlelement]$node, [string]$side) {
+        # Prefer attributes, then child elements
         $disp  = $node.GetAttribute("displayName")
         if (-not $disp) { $disp = $node.GetAttribute("name") }
         if (-not $disp -and $node.SelectSingleNode("displayName")) { $disp = $node.SelectSingleNode("displayName").InnerText }
 
         $state = $node.GetAttribute("state")
         if (-not $state) {
-            $enabledAttr = $node.GetAttribute("enabled")
-            $disabledAttr= $node.GetAttribute("disabled")
-            if ($enabledAttr)  { $state = "Enabled=$enabledAttr" }
-            elseif ($disabledAttr) { $state = "Disabled=$disabledAttr" }
+            $enabledAttr  = $node.GetAttribute("enabled")
+            $disabledAttr = $node.GetAttribute("disabled")
+            if ($enabledAttr)       { $state = "Enabled=$enabledAttr" }
+            elseif ($disabledAttr)  { $state = "Disabled=$disabledAttr" }
             elseif ($node.SelectSingleNode("state")) { $state = $node.SelectSingleNode("state").InnerText }
         }
 
@@ -77,26 +134,27 @@ function Get-GpoSettingLines([xml]$GpoXml) {
         if ($parts.Count) { $lines.Add(($parts -join " | ")) }
     }
 
-    # Policies
+    # 1) Any <Policy> node anywhere
     $policyNodes = $GpoXml.SelectNodes("//GPO//*[local-name()='Policy']")
     foreach ($n in $policyNodes) { Grab -node $n -side (Get-SideTag $n) }
 
-    # Registry Prefs
+    # 2) Registry Preferences
     $regNodes = $GpoXml.SelectNodes("//GPO//RegistrySettings/RegistrySetting")
     foreach ($n in $regNodes) {
         $side = Get-SideTag $n
         $lines.Add(("{0} RegistryPreference | Action={1} | Key={2} | ValueName={3} | Data={4} | Type={5}" -f $side,$n.Action,$n.Key,$n.ValueName,$n.Data,$n.Type).Trim())
     }
 
-    # Generic Prefs
+    # 3) Generic Preferences (Files, Shortcuts, Tasks, etc.) — nodes with an 'action' attribute
     $prefNodes = $GpoXml.SelectNodes("//GPO//*[local-name()='Preferences']//*[@action]")
     foreach ($n in $prefNodes) {
-        $side = Get-SideTag $n
-        $type = $n.Name
+        $side   = Get-SideTag $n
+        $type   = $n.Name
         $action = $n.GetAttribute("action")
-        $name = $n.GetAttribute("name")
-        $path = $n.GetAttribute("path"); if (-not $path) { $path = $n.GetAttribute("targetPath") }
-        $desc = $n.GetAttribute("description")
+        $name   = $n.GetAttribute("name")
+        $path   = $n.GetAttribute("path"); if (-not $path) { $path = $n.GetAttribute("targetPath") }
+        $dest   = $n.GetAttribute("destination"); if (-not $path) { $path = $dest }
+        $desc   = $n.GetAttribute("description")
 
         $parts = @($side, "Preference:$type", "Action=$action")
         if ($name) { $parts += "Name=$name" }
@@ -105,7 +163,7 @@ function Get-GpoSettingLines([xml]$GpoXml) {
         $lines.Add(($parts -join " | "))
     }
 
-    # Scripts
+    # 4) Scripts (Startup/Shutdown/Logon/Logoff)
     $scriptNodes = $GpoXml.SelectNodes("//GPO//Scripts/*/Script")
     foreach ($s in $scriptNodes) {
         $phase = $s.ParentNode.Name
@@ -115,7 +173,7 @@ function Get-GpoSettingLines([xml]$GpoXml) {
         $lines.Add(("{0} Script:{1} | {2} {3}" -f $side,$phase,$cmd,$pars).Trim())
     }
 
-    # SecEdit (account/audit/etc.)
+    # 5) Common SecEdit summaries (Account/Kerberos/Audit/etc.)
     foreach ($nodeName in @("Account","Kerberos","Audit","EventAudit","PasswordPolicy","KerberosPolicy")) {
         $nodes = $GpoXml.SelectNodes("//GPO//Computer/$nodeName/*")
         foreach ($n in $nodes) {
@@ -127,91 +185,244 @@ function Get-GpoSettingLines([xml]$GpoXml) {
     ($lines | Where-Object { $_ -and $_.Trim() } | Sort-Object -Unique)
 }
 
-# --- MAIN ---
+# --- Collect GPOs and cache reports (with stdout progress) ---
 $allGpos = Get-GPO -All
-Write-Host "Discovered $($allGpos.Count) GPOs in the domain."
+Write-Host "Discovered $($allGpos.Count) GPO(s) in the domain."
+
+$gpoXmlCache      = @{}
+$gpoWmiCache      = @{}
+$gpoFiltersCache  = @{}
+$gpoSettingsCache = @{}
+$gpoStatusCache   = @{}
 
 $totalSettings = 0
-$gpoXmlCache = @{}
-
 foreach ($gpo in $allGpos) {
     try {
-        $xmlText = Get-GPOReport -Guid $gpo.Id -ReportType Xml
-        [xml]$xml = $xmlText
-        $gpoXmlCache[$gpo.Id] = $xml
+        [xml]$xml = Get-GPOReport -Guid $gpo.Id -ReportType Xml -ErrorAction Stop
+        $gpoXmlCache[$gpo.Id.Guid.ToString()]      = $xml
+        $gpoWmiCache[$gpo.Id.Guid.ToString()]      = Get-GpoWmiFilterFromXml -GpoXml $xml
+        $gpoFiltersCache[$gpo.Id.Guid.ToString()]  = Get-GpoSecurityFilters -GpoName $gpo.DisplayName
+        $gpoStatusCache[$gpo.Id.Guid.ToString()]   = Get-GpoStatusInfo -gpoObj $gpo -gpoXml $xml
+
         $settings = Get-GpoSettingLines -GpoXml $xml
+        $gpoSettingsCache[$gpo.Id.Guid.ToString()] = $settings
         $totalSettings += $settings.Count
-        Write-Host ("  GPO: {0} -> {1} settings" -f $gpo.DisplayName, $settings.Count)
+
+        Write-Host ("  GPO: {0} -> {1} setting(s)" -f $gpo.DisplayName, $settings.Count)
     } catch {
         Write-Warning "Failed to parse $($gpo.DisplayName): $_"
     }
 }
 Write-Host "Total settings parsed across all GPOs: $totalSettings"
 
-# Build HTML
-$sb = New-Object System.Text.StringBuilder
-AddLine $sb "<html><head><meta charset='utf-8'><title>GPO Tree Report</title>"
-AddLine $sb "<style>body{font-family:Segoe UI,Arial;} ul{list-style-type:none;} .gpo{margin-left:20px;} .badge{padding:2px 4px; border-radius:4px; font-size:0.8em; margin-left:4px;} .enforced{background:#d9534f;color:white;} .warn{background:#f0ad4e;color:white;} .ok{background:#5cb85c;color:white;} .small{font-size:0.9em;color:#666;} details{margin:4px 0;} summary{cursor:pointer;} </style>"
-AddLine $sb "</head><body>"
-AddLine $sb "<h1>Group Policy Tree Report</h1>"
-AddLine $sb "<p>Discovered $($allGpos.Count) GPOs, with $totalSettings settings across all policies.</p>"
+# --- Gather OUs and Domain Root for tree ---
+$domain = Get-ADDomain
+$ouList = Get-ADOrganizationalUnit -Filter * -Properties Name,DistinguishedName | Sort-Object DistinguishedName
+$targets = @("DomainRoot") + ($ouList | ForEach-Object { $_.DistinguishedName })
 
-# OUs with linked GPOs
-$roots = Get-ADOrganizationalUnit -Filter * | Sort-Object DistinguishedName
-foreach ($ou in $roots) {
-    $links = Get-GPInheritance -Target $ou.DistinguishedName
-    $inheritanceBlocked = $links.BlockInheritance
+# --- Track linked vs unused GPOs ---
+$linkedGuids = [System.Collections.Generic.HashSet[string]]::new()
+$allGuidSet  = [System.Collections.Generic.HashSet[string]]::new()
+foreach ($g in $allGpos) { [void]$allGuidSet.Add($g.Id.Guid.ToString()) }
 
-    AddLine $sb "<ul><li><b>OU:</b> $(HtmlEsc $ou.Name) <span class='small kv'>($($ou.DistinguishedName))</span>"
-    if ($inheritanceBlocked) { AddLine $sb "<span class='badge warn'>Inheritance Blocked</span>" }
+# --- Build HTML (double quotes; numeric entities for separators) ---
+$sb  = New-Object System.Text.StringBuilder
+$css = @(
+"<style>",
+"body { font-family: Segoe UI, Arial, sans-serif; margin: 20px; }",
+"h1 { margin-bottom: 0; }",
+".subtle { color: #555; }",
+".kv { font-family: ui-monospace, Consolas, monospace; }",
+".badge { display:inline-block; padding:2px 6px; border-radius:8px; font-size:12px; margin-right:6px; border:1px solid #ccc; }",
+".badge.enforced { background:#ffe9e9; border-color:#e09999; }",
+".badge.disabled { background:#f5f5f5; }",
+".badge.ok { background:#eaf7ea; border-color:#88b188; }",
+".badge.warn { background:#fff7e0; border-color:#d9c06b; }",
+".tree { margin: 0; padding-left: 20px; list-style-type: none; }",
+".tree li { margin: 6px 0; }",
+".tree li .title { font-weight:600; }",
+"details { margin: 4px 0; }",
+"summary { cursor: pointer; }",
+".small { font-size: 12px; color:#666; }",
+".meta { margin:2px 0 6px 0; }",
+"code { background:#f6f6f6; padding:1px 4px; border-radius:4px; }",
+".section { margin-top: 24px; }",
+"hr { border:0; border-top:1px solid #ddd; margin:16px 0; }",
+"table { border-collapse: collapse; }",
+"td, th { padding: 6px 8px; border:1px solid #ddd; }",
+"</style>"
+) -join "`n"
 
-    if ($links.GpoLinks.Count -eq 0) {
-        AddLine $sb "<div class='small subtle'>(No linked GPOs)</div></li></ul>"
+$domainEsc = HtmlEsc $domain.DNSRoot
+$nowStr    = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+
+AddLine $sb "<!DOCTYPE html><html><head><meta charset=""utf-8""><title>GPO Tree Report - $domainEsc</title>$css</head><body>"
+AddLine $sb "<h1>GPO Tree Report</h1><div class=""subtle"">Domain: <span class=""kv"">$domainEsc</span> &#8226; Generated: <span class=""kv"">$nowStr</span></div><hr />"
+AddLine $sb "<div class=""section""><h2>OU &#8594; GPO Links</h2><ul class=""tree"">"
+
+foreach ($t in $targets) {
+    if ($t -eq "DomainRoot") {
+        $label = "Domain (root)"
+        $targetDN = $domain.DistinguishedName
+    } else {
+        $ouObj = Get-ADObject -Identity $t -Properties Name,DistinguishedName
+        $label = $ouObj.Name
+        $targetDN = $ouObj.DistinguishedName
+    }
+
+    $inheritance = Get-GPInheritance -Target $targetDN
+    $inheritanceBlocked = $inheritance.BlockInheritance
+
+    AddLine $sb ("<li><span class=""title"">OU:</span> {0} <span class=""small kv"">({1})</span> " -f (HtmlEsc $label), (HtmlEsc $targetDN))
+    if ($inheritanceBlocked) { AddLine $sb "<span class=""badge warn"">Inheritance Blocked</span>" }
+
+    if (-not $inheritance.GpoLinks -or $inheritance.GpoLinks.Count -eq 0) {
+        AddLine $sb "<div class=""small subtle"">(No linked GPOs)</div></li>"
         continue
     }
 
-    AddLine $sb "<ul>"
-    foreach ($l in $links.GpoLinks) {
-        $gpo = $allGpos | Where-Object { $_.DisplayName -eq $l.DisplayName }
-        if (-not $gpo) { continue }
-        $xml = $gpoXmlCache[$gpo.Id]
-        $settings = Get-GpoSettingLines -GpoXml $xml
+    AddLine $sb "<ul class=""tree"">"
+    foreach ($link in $inheritance.GpoLinks) {
+        $guidStr = $link.GpoId.Guid.ToString()
+        [void]$linkedGuids.Add($guidStr)
 
-        AddLine $sb "<li class='gpo'><b>GPO:</b> $(HtmlEsc $gpo.DisplayName)"
-        if ($l.Enforced) { AddLine $sb "<span class='badge enforced'>Enforced</span>" }
-        if ($l.WmiFilter) { AddLine $sb "<span class='badge ok'>WMI: $(HtmlEsc $l.WmiFilter.Name)</span>" }
-        AddLine $sb " &nbsp;&nbsp; <b>Status:</b> $($gpo.GpoStatus)"
-
-        AddLine $sb "<details><summary>Settings ($($settings.Count))</summary><ul>"
-        foreach ($s in $settings) {
-            AddLine $sb "<li>$(HtmlEsc $s)</li>"
+        $gpo = ($allGpos | Where-Object { $_.Id.Guid -eq $link.GpoId.Guid })
+        if (-not $gpo) {
+            AddLine $sb ("<li><span class=""title"">Missing GPO:</span> {0}</li>" -f (HtmlEsc $guidStr))
+            continue
         }
-        AddLine $sb "</ul></details></li>"
+
+        $xml      = $gpoXmlCache[$guidStr]
+        $wmi      = $gpoWmiCache[$guidStr]
+        $filters  = $gpoFiltersCache[$guidStr]
+        $settings = $gpoSettingsCache[$guidStr]
+        $status   = $gpoStatusCache[$guidStr]
+
+        AddLine $sb ("<li><div><span class=""title"">GPO:</span> {0} <span class=""small kv"">({1})</span> " -f (HtmlEsc $gpo.DisplayName), (HtmlEsc $guidStr))
+        if ($link.Enforced) { AddLine $sb "<span class=""badge enforced"">Enforced</span>" }
+        if (-not $link.Enabled) { AddLine $sb "<span class=""badge disabled"">Link Disabled</span>" }
+        if ($status.UserSettingsDisabled)     { AddLine $sb "<span class=""badge warn"">User settings disabled</span>" }
+        if ($status.ComputerSettingsDisabled) { AddLine $sb "<span class=""badge warn"">Computer settings disabled</span>" }
+        if ($wmi) { AddLine $sb ("<span class=""badge ok"">WMI: {0}</span>" -f (HtmlEsc $wmi)) }
+        AddLine $sb "</div>"
+
+        AddLine $sb ("<div class=""meta small""><b>Link Flags:</b> Enforced={0}, LinkEnabled={1} &#160; | &#160; <b>GPO Status:</b> {2}" -f ($(if($link.Enforced){'True'}else{'False'}), $(if($link.Enabled){'True'}else{'False'}), (HtmlEsc $status.StatusString)))
+        if ($filters -and $filters.Count) {
+            AddLine $sb " &#160; | &#160; <b>Security Filtering:</b> "
+            AddLine $sb (($filters | ForEach-Object { HtmlEsc $_ }) -join ", ")
+        }
+        AddLine $sb "</div>"
+
+        AddLine $sb ("<details><summary>Settings ({0})</summary><ul class=""tree"">" -f $settings.Count)
+        if ($settings.Count -gt 0) {
+            foreach ($s in $settings) { AddLine $sb ("<li><code>{0}</code></li>" -f (HtmlEsc $s)) }
+        } else {
+            AddLine $sb "<li class=""small subtle"">(No explicit settings parsed or not applicable)</li>"
+        }
+        AddLine $sb "</ul></details>"
+
+        AddLine $sb "</li>"
     }
-    AddLine $sb "</ul></li></ul>"
+    AddLine $sb "</ul></li>"
+}
+AddLine $sb "</ul></div>"
+
+# --- Summary + Efficiency lists ---
+$gposUserDisabled     = @()
+$gposComputerDisabled = @()
+foreach ($g in $allGpos) {
+    $st = $gpoStatusCache[$g.Id.Guid.ToString()]
+    if ($st.UserSettingsDisabled)     { $gposUserDisabled     += $g }
+    if ($st.ComputerSettingsDisabled) { $gposComputerDisabled += $g }
 }
 
-# Unused GPOs
-$linkedGuids = @()
-foreach ($ou in $roots) {
-    $links = Get-GPInheritance -Target $ou.DistinguishedName
-    foreach ($l in $links.GpoLinks) { if ($l) { $linkedGuids += $l.GpoId } }
-}
-$unused = $allGpos | Where-Object { $linkedGuids -notcontains $_.Id }
-AddLine $sb "<h2>Unused GPOs</h2><ul>"
-foreach ($g in $unused) {
-    $xml = $gpoXmlCache[$g.Id]
-    $settings = Get-GpoSettingLines -GpoXml $xml
-    AddLine $sb "<li><b>$(HtmlEsc $g.DisplayName)</b> &nbsp;&nbsp;<b>Status:</b> $($g.GpoStatus)"
-    AddLine $sb "<details><summary>Settings ($($settings.Count))</summary><ul>"
-    foreach ($s in $settings) {
-        AddLine $sb "<li>$(HtmlEsc $s)</li>"
-    }
-    AddLine $sb "</ul></details></li>"
-}
-AddLine $sb "</ul>"
+AddLine $sb "<div class=""section""><h2>Summary</h2><table><tbody>"
+AddLine $sb ("<tr><th>Total OUs (incl. root)</th><td>{0}</td></tr>" -f $targets.Count)
+AddLine $sb ("<tr><th>Total GPOs</th><td>{0}</td></tr>" -f $allGpos.Count)
+AddLine $sb ("<tr><th>Linked GPOs</th><td>{0}</td></tr>" -f $linkedGuids.Count)
+AddLine $sb ("<tr><th>Unused GPOs</th><td>{0}</td></tr>" -f ($allGuidSet.Count - $linkedGuids.Count))
+AddLine $sb ("<tr><th>Total Settings Parsed</th><td>{0}</td></tr>" -f $totalSettings)
+AddLine $sb "</tbody></table>"
 
+AddLine $sb "<div style=""margin-top:10px"">"
+AddLine $sb "<details><summary><b>GPOs with User settings disabled</b> (for efficiency)</summary><ul class=""tree"">"
+if ($gposUserDisabled) {
+    foreach ($g in ($gposUserDisabled | Sort-Object DisplayName)) {
+        AddLine $sb ("<li>{0} <span class=""small kv"">({1})</span></li>" -f (HtmlEsc $g.DisplayName), (HtmlEsc $g.Id.Guid.ToString()))
+    }
+} else {
+    AddLine $sb "<li class=""small subtle"">(None)</li>"
+}
+AddLine $sb "</ul></details>"
+
+AddLine $sb "<details><summary><b>GPOs with Computer settings disabled</b> (for efficiency)</summary><ul class=""tree"">"
+if ($gposComputerDisabled) {
+    foreach ($g in ($gposComputerDisabled | Sort-Object DisplayName)) {
+        AddLine $sb ("<li>{0} <span class=""small kv"">({1})</span></li>" -f (HtmlEsc $g.DisplayName), (HtmlEsc $g.Id.Guid.ToString()))
+    }
+} else {
+    AddLine $sb "<li class=""small subtle"">(None)</li>"
+}
+AddLine $sb "</ul></details>"
+AddLine $sb "</div></div>"
+
+# --- Unused GPOs ---
+$unusedGuids = [System.Collections.Generic.HashSet[string]]::new()
+foreach ($k in $allGuidSet) { if (-not $linkedGuids.Contains($k)) { [void]$unusedGuids.Add($k) } }
+
+AddLine $sb "<div class=""section""><h2>Unused GPOs</h2>"
+if ($unusedGuids.Count -eq 0) {
+    AddLine $sb "<div class=""small subtle"">(None)</div>"
+} else {
+    AddLine $sb "<ul class=""tree"">"
+    foreach ($guid in ($unusedGuids | Sort-Object)) {
+        $g = $allGpos | Where-Object { $_.Id.Guid.ToString() -eq $guid }
+        if (-not $g) { continue }
+        $xml      = $gpoXmlCache[$guid]
+        $wmi      = $gpoWmiCache[$guid]
+        $filters  = $gpoFiltersCache[$guid]
+        $settings = $gpoSettingsCache[$guid]
+        $status   = $gpoStatusCache[$guid]
+
+        AddLine $sb ("<li><div><span class=""title"">GPO:</span> {0} <span class=""small kv"">({1})</span> " -f (HtmlEsc $g.DisplayName), (HtmlEsc $guid))
+        if ($status.UserSettingsDisabled)     { AddLine $sb "<span class=""badge warn"">User settings disabled</span>" }
+        if ($status.ComputerSettingsDisabled) { AddLine $sb "<span class=""badge warn"">Computer settings disabled</span>" }
+        if ($wmi) { AddLine $sb ("<span class=""badge ok"">WMI: {0}</span>" -f (HtmlEsc $wmi)) }
+        AddLine $sb "</div>"
+
+        if ($filters -and $filters.Count) {
+            AddLine $sb "<div class=""meta small""><b>Security Filtering:</b> "
+            AddLine $sb (($filters | ForEach-Object { HtmlEsc $_ }) -join ", ")
+            AddLine $sb "</div>"
+        }
+
+        AddLine $sb ("<details><summary>Settings ({0})</summary><ul class=""tree"">" -f $settings.Count)
+        if ($settings.Count -gt 0) {
+            foreach ($s in $settings) { AddLine $sb ("<li><code>{0}</code></li>" -f (HtmlEsc $s)) }
+        } else {
+            AddLine $sb "<li class=""small subtle"">(No explicit settings parsed or not applicable)</li>"
+        }
+        AddLine $sb "</ul></details>"
+
+        AddLine $sb "</li>"
+    }
+    AddLine $sb "</ul>"
+}
+AddLine $sb "</div>"
+
+AddLine $sb "<hr /><div class=""small subtle"">Tip: Disabling the unused half (User/Computer) can reduce processing time.</div>"
 AddLine $sb "</body></html>"
-$sb.ToString() | Out-File -FilePath $OutputPath -Encoding UTF8
 
-Write-Host "HTML report written to $OutputPath"
+# --- Write HTML Report (ensure directory exists) ---
+try {
+    $reportDir = Split-Path -Parent $OutputPath
+    if ($reportDir -and -not (Test-Path -LiteralPath $reportDir)) {
+        Write-Host "Creating report directory: $reportDir"
+        New-Item -Path $reportDir -ItemType Directory -Force | Out-Null
+    }
+    $html = $sb.ToString()
+    [System.IO.File]::WriteAllText((Resolve-Path -LiteralPath (if ($OutputPath.Contains(':')) { $OutputPath } else { (Join-Path -Path (Get-Location) -ChildPath $OutputPath) })), $html, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "HTML report written to $OutputPath"
+} catch {
+    Write-Error "Failed to write HTML report: $_"
+}
