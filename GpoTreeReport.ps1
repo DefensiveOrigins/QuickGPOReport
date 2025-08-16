@@ -1,10 +1,10 @@
 <# 
-GPO Tree → HTML report (safe quoting, no bare &)
+GPO Tree → HTML report (safe quoting; broad settings enumeration)
 - OUs (incl. Domain root) → linked GPOs
 - Flags: Enforced, Link Enabled/Disabled
 - GPO Status badges: User/Computer settings disabled
 - WMI filter, Security filtering groups
-- One-line-per-setting from GPO XML
+- One-line-per-setting from GPO XML (aggressive XPath, Admin Templates, Preferences, Scripts, SecEdit)
 - Separate "Unused GPOs" section
 
 Requirements: RSAT ActiveDirectory + GroupPolicy modules
@@ -111,70 +111,107 @@ function Get-GpoStatusInfo($gpoObj, [xml]$gpoXml) {
     }
 }
 
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# UPDATED: Aggressive settings extraction over multiple schemas
 function Get-GpoSettingLines([xml]$GpoXml) {
     $lines = New-Object System.Collections.Generic.List[string]
     if (-not $GpoXml) { return $lines }
 
-    # Admin Templates-like <Policy> nodes
-    $policyNodes = $GpoXml.SelectNodes("//ExtensionData/Extension/Policy")
-    foreach ($n in $policyNodes) {
-        $disp  = @($n.displayName, $n.Attributes['displayName'].Value | Where-Object {$_})[0]
-        $state = @($n.state,       $n.Attributes['state'].Value       | Where-Object {$_})[0]
-        $key   = @($n.key,         $n.Attributes['key'].Value         | Where-Object {$_})[0]
-        $val   = @($n.value,       $n.Attributes['value'].Value       | Where-Object {$_})[0]
-        $data  = @($n.data,        $n.Attributes['data'].Value        | Where-Object {$_})[0]
+    function Get-SideTag([xml.xmlelement]$node) {
+        $n = $node
+        while ($n -and $n.Name -ne "GPO") {
+            if ($n.Name -eq "Computer") { return "[Computer]" }
+            if ($n.Name -eq "User")     { return "[User]" }
+            $n = $n.ParentNode
+        }
+        return ""
+    }
+
+    function Grab([xml.xmlelement]$node, [string]$side) {
+        # Prefer attributes, then child elements
+        $disp  = $node.GetAttribute("displayName")
+        if (-not $disp) { $disp = $node.GetAttribute("name") }
+        if (-not $disp -and $node.SelectSingleNode("displayName")) { $disp = $node.SelectSingleNode("displayName").InnerText }
+
+        $state = $node.GetAttribute("state")
+        if (-not $state) {
+            $enabledAttr  = $node.GetAttribute("enabled")
+            $disabledAttr = $node.GetAttribute("disabled")
+            if ($enabledAttr)       { $state = "Enabled=$enabledAttr" }
+            elseif ($disabledAttr)  { $state = "Disabled=$disabledAttr" }
+            elseif ($node.SelectSingleNode("state")) { $state = $node.SelectSingleNode("state").InnerText }
+        }
+
+        $key   = $node.GetAttribute("key");        if (-not $key   -and $node.SelectSingleNode("key"))   { $key   = $node.SelectSingleNode("key").InnerText }
+        $value = $node.GetAttribute("value");      if (-not $value -and $node.SelectSingleNode("value")) { $value = $node.SelectSingleNode("value").InnerText }
+        $data  = $node.GetAttribute("data");       if (-not $data  -and $node.SelectSingleNode("data"))  { $data  = $node.SelectSingleNode("data").InnerText }
+
         $parts = @()
+        if ($side)  { $parts += $side }
         if ($disp)  { $parts += $disp }
         if ($state) { $parts += "State=$state" }
         if ($key)   { $parts += "Key=$key" }
-        if ($val)   { $parts += "ValueName=$val" }
+        if ($value) { $parts += "ValueName=$value" }
         if ($data)  { $parts += "Data=$data" }
+
+        if (-not $disp -and -not $state -and -not $key -and -not $value -and -not $data) {
+            $text = ($node.InnerText -replace '\s+',' ').Trim()
+            if ($text) { $parts += $text }
+        }
         if ($parts.Count) { $lines.Add(($parts -join " | ")) }
     }
 
-    # Registry Preferences
-    $regNodes = $GpoXml.SelectNodes("//RegistrySettings/RegistrySetting")
+    # 1) Any <Policy> element anywhere
+    $policyNodes = $GpoXml.SelectNodes("//GPO//*[local-name()='Policy']")
+    foreach ($n in $policyNodes) { Grab -node $n -side (Get-SideTag $n) }
+
+    # 2) Registry Preferences (explicit)
+    $regNodes = $GpoXml.SelectNodes("//GPO//RegistrySettings/RegistrySetting")
     foreach ($n in $regNodes) {
-        $lines.Add(("RegistryPreference | Action={0} | Key={1} | ValueName={2} | Data={3} | Type={4}" -f $n.Action,$n.Key,$n.ValueName,$n.Data,$n.Type))
+        $side = Get-SideTag $n
+        $lines.Add(("{0} RegistryPreference | Action={1} | Key={2} | ValueName={3} | Data={4} | Type={5}" -f $side,$n.Action,$n.Key,$n.ValueName,$n.Data,$n.Type).Trim())
     }
 
-    # Scripts
-    $scriptNodes = $GpoXml.SelectNodes("//Scripts/*/Script")
+    # 3) Generic Preferences catch-all (Files/Shortcuts/Tasks/etc.) — nodes with an 'action' attribute
+    $prefNodes = $GpoXml.SelectNodes("//GPO//*[local-name()='Preferences']//*[@action]")
+    foreach ($n in $prefNodes) {
+        $side   = Get-SideTag $n
+        $type   = $n.Name
+        $action = $n.GetAttribute("action")
+        $name   = $n.GetAttribute("name")
+        $path   = $n.GetAttribute("path"); if (-not $path) { $path = $n.GetAttribute("targetPath") }
+        $dest   = $n.GetAttribute("destination"); if (-not $path) { $path = $dest }
+        $desc   = $n.GetAttribute("description")
+
+        $parts = @($side, "Preference:$type", "Action=$action")
+        if ($name) { $parts += "Name=$name" }
+        if ($path) { $parts += "Path=$path" }
+        if ($desc) { $parts += "Desc=$desc" }
+        $lines.Add(($parts -join " | "))
+    }
+
+    # 4) Scripts (Startup/Shutdown/Logon/Logoff)
+    $scriptNodes = $GpoXml.SelectNodes("//GPO//Scripts/*/Script")
     foreach ($s in $scriptNodes) {
-        $phase = $s.ParentNode.Name; $cmd = $s.Command; $pars = $s.Parameters
-        $lines.Add(("Script:{0} | {1} {2}" -f $phase,$cmd,$pars).Trim())
+        $phase = $s.ParentNode.Name
+        $cmd   = $s.Command
+        $pars  = $s.Parameters
+        $side  = Get-SideTag $s
+        $lines.Add(("{0} Script:{1} | {2} {3}" -f $side,$phase,$cmd,$pars).Trim())
     }
 
-    # Generic Policy elements under Computer/User
-    $secPolNodes = $GpoXml.SelectNodes("//Computer/*//Policy | //User/*//Policy")
-    foreach ($n in $secPolNodes) {
-        if ($policyNodes -and ($policyNodes -contains $n)) { continue }
-        $disp  = @($n.displayName, $n.Attributes['displayName'].Value | Where-Object {$_})[0]
-        $state = @($n.state,       $n.Attributes['state'].Value       | Where-Object {$_})[0]
-        $val   = @($n.value,       $n.Attributes['value'].Value       | Where-Object {$_})[0]
-        $data  = @($n.data,        $n.Attributes['data'].Value        | Where-Object {$_})[0]
-        $key   = @($n.key,         $n.Attributes['key'].Value         | Where-Object {$_})[0]
-        $parts = @()
-        if ($disp)  { $parts += $disp }
-        if ($state) { $parts += "State=$state" }
-        if ($key)   { $parts += "Key=$key" }
-        if ($val)   { $parts += "ValueName=$val" }
-        if ($data)  { $parts += "Data=$data" }
-        if ($parts.Count) { $lines.Add(($parts -join " | ")) }
-    }
-
-    # Common summaries
-    foreach ($nodeName in @("Account","Kerberos","Audit")) {
-        $nodes = $GpoXml.SelectNodes("//Computer/$nodeName/*")
+    # 5) Common SecEdit summaries (Account/Kerberos/Audit/etc.)
+    foreach ($nodeName in @("Account","Kerberos","Audit","EventAudit","PasswordPolicy","KerberosPolicy")) {
+        $nodes = $GpoXml.SelectNodes("//GPO//Computer/$nodeName/*")
         foreach ($n in $nodes) {
-            if ($n.InnerText -and $n.InnerText.Trim()) {
-                $lines.Add(("Computer:{0} | {1}" -f $nodeName, ($n.OuterXml -replace '<.*?>',' ' -replace '\s+',' ').Trim()))
-            }
+            $txt = ($n.OuterXml -replace '<.*?>',' ' -replace '\s+',' ').Trim()
+            if ($txt) { $lines.Add(("[Computer] {0} | {1}" -f $nodeName, $txt)) }
         }
     }
 
-    $lines | Where-Object { $_ -and $_.Trim() } | Sort-Object -Unique
+    ($lines | Where-Object { $_ -and $_.Trim() } | Sort-Object -Unique)
 }
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 function AddLine([System.Text.StringBuilder]$sb, [string]$text) { [void]$sb.Append($text) }
 
@@ -211,7 +248,7 @@ $linkedGuids = [System.Collections.Generic.HashSet[string]]::new()
 $unusedGuids = [System.Collections.Generic.HashSet[string]]::new()
 foreach ($k in $allGpos.Keys) { [void]$unusedGuids.Add($k) }
 
-# ---------- Build HTML (double quotes + numeric entities) ----------
+# ---------- Build HTML (double quotes + numeric entities, no here-strings) ----------
 $sb   = New-Object System.Text.StringBuilder
 $css  = @(
 "<style>",
@@ -299,9 +336,7 @@ foreach ($ou in $ous) {
         # Settings
         AddLine $sb ("<details><summary>Settings ({0})</summary><ul class=""tree"">" -f $settings.Count)
         if ($settings.Count -gt 0) {
-            foreach ($s in $settings) {
-                AddLine $sb ("<li><code>{0}</code></li>" -f (HtmlEsc $s))
-            }
+            foreach ($s in $settings) { AddLine $sb ("<li><code>{0}</code></li>" -f (HtmlEsc $s)) }
         } else {
             AddLine $sb "<li class=""small subtle"">(No explicit settings parsed or not applicable)</li>"
         }
@@ -383,9 +418,7 @@ if ($unusedGuids.Count -eq 0) {
 
         AddLine $sb ("<details><summary>Settings ({0})</summary><ul class=""tree"">" -f $settings.Count)
         if ($settings.Count -gt 0) {
-            foreach ($s in $settings) {
-                AddLine $sb ("<li><code>{0}</code></li>" -f (HtmlEsc $s))
-            }
+            foreach ($s in $settings) { AddLine $sb ("<li><code>{0}</code></li>" -f (HtmlEsc $s)) }
         } else {
             AddLine $sb "<li class=""small subtle"">(No explicit settings parsed or not applicable)</li>"
         }
